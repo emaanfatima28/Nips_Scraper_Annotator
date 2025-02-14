@@ -1,6 +1,8 @@
 import asyncio
 import os
 import re
+import random
+import time
 import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
@@ -9,7 +11,7 @@ class NeuripsPaperFetcher:
     BASE_WEBSITE = "https://papers.nips.cc"
     RETRY_LIMIT = 5
     REQUEST_TIMEOUT = 180
-    CONNECTIONS_LIMIT = 2
+    CONNECTIONS_LIMIT = 1  
     RETRY_DELAYS = [2, 4, 8, 16, 32]
     
     HEADERS = {
@@ -45,17 +47,41 @@ class NeuripsPaperFetcher:
                     print(f"No papers found for {year}.")
                     return
                 print(f"Discovered {len(paper_links)} papers for {year}")
-                await asyncio.gather(*(self.process_paper(session, year, paper) for paper in paper_links))
+
+                # Process each paper with a slight delay
+                for paper in paper_links:
+                    await self.process_paper(session, year, paper)
+                    await asyncio.sleep(random.uniform(2, 5))  # Random delay between 2-5 seconds
+
         except Exception as err:
             print(f"Error fetching {year_url}: {err}")
 
     async def process_paper(self, session, year, paper):
         paper_title = paper.text.strip()
         paper_page = f"{self.BASE_WEBSITE}{paper['href']}"
-        pdf_file = paper_page.replace('hash/', 'file/').replace("Abstract", "Paper").replace('.html', '.pdf')
         
-        clean_title = re.sub(r'[<>:"/\\|?*]', '_', paper_title) + ".pdf"
-        await self.download_pdf_file(session, pdf_file, clean_title)
+        # Fetch the paper's details page to get the correct PDF link
+        try:
+            async with session.get(paper_page) as response:
+                if response.status != 200:
+                    print(f"Failed to retrieve {paper_page}, Status: {response.status}")
+                    return
+                page_content = await response.text()
+                soup = BeautifulSoup(page_content, 'html.parser')
+
+                # Find the actual PDF download link
+                pdf_link = soup.select_one('a[href$=".pdf"]')
+                if not pdf_link:
+                    print(f"No PDF link found for {paper_title}")
+                    return
+
+                pdf_url = f"{self.BASE_WEBSITE}{pdf_link['href']}"
+                
+                # Clean title for valid filename
+                clean_title = re.sub(r'[<>:"/\\|?*]', '_', paper_title) + ".pdf"
+                await self.download_pdf_file(session, pdf_url, clean_title)
+        except Exception as err:
+            print(f"Error processing {paper_page}: {err}")
 
     async def download_pdf_file(self, session, pdf_url, file_name):
         return await self.retry_request(session, pdf_url, self._save_pdf, file_name)
@@ -78,14 +104,16 @@ class NeuripsPaperFetcher:
             return False
 
     async def retry_request(self, session, url, func, *args, retries=RETRY_LIMIT):
-        for attempt, delay in zip(range(retries), self.RETRY_DELAYS):
+        for attempt, delay in enumerate(self.RETRY_DELAYS, start=1):
             try:
                 return await func(session, url, *args)
-            except (aiohttp.ClientError, ConnectionResetError, asyncio.TimeoutError) as err:
-                print(f"Retry {attempt + 1} failed for {url}: {err}")
-            print(f"Waiting {delay} seconds before retrying {url}...")
-            await asyncio.sleep(delay)
-        print(f"All retries failed for {url}")
+            except (aiohttp.ClientError, ConnectionResetError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as err:
+                print(f"Retry {attempt} failed for {url}: {err}")
+                if attempt == retries:
+                    print(f"All retries failed for {url}")
+                    return None
+                print(f"Waiting {delay} seconds before retrying {url}...")
+                time.sleep(delay)  # Blocking sleep to avoid too many requests
         return None
 
 async def run():
